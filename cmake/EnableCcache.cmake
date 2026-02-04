@@ -1,0 +1,8 @@
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    message(STATUS "ccache found: ${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "")
+else()
+    message(STATUS "ccache not found, building without cache")
+endif()

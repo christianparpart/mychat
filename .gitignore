@@ -1,0 +1,24 @@
+# Manual version file
+version.txt
+
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dependency cache
+_deps/
+download/
