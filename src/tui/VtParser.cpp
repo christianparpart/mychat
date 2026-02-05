@@ -207,6 +207,14 @@ void VtParser::processEscape(std::uint8_t byte, std::vector<InputEvent>& events)
         return;
     }
 
+    // Alt+Enter: ESC followed by CR or LF
+    if (byte == '\r' || byte == '\n')
+    {
+        events.emplace_back(KeyEvent { .key = KeyCode::Enter, .modifiers = Modifier::Alt });
+        _state = State::Ground;
+        return;
+    }
+
     // Alt+character: ESC followed by printable
     if (byte >= 0x20 && byte < 0x7F)
     {

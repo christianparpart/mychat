@@ -134,11 +134,21 @@ auto InputField::handleKey(KeyEvent const& key) -> InputFieldAction
 {
     auto const ctrl = hasModifier(key.modifiers, Modifier::Ctrl);
     auto const alt = hasModifier(key.modifiers, Modifier::Alt);
+    auto const shift = hasModifier(key.modifiers, Modifier::Shift);
 
     // Special keys
     switch (key.key)
     {
-        case KeyCode::Enter: _lastWasKill = false; return InputFieldAction::Submit;
+        case KeyCode::Enter:
+            _lastWasKill = false;
+            // In multiline mode: Shift+Enter OR Alt+Enter inserts newline
+            // Alt+Enter works universally (ESC prefix), Shift+Enter requires Kitty protocol
+            if (_multiline && (shift || alt))
+            {
+                insertNewline();
+                return InputFieldAction::Changed;
+            }
+            return InputFieldAction::Submit;
         case KeyCode::Tab:
             // Tab could be expanded in the future; for now insert literal tab
             _lastWasKill = false;
@@ -158,12 +168,18 @@ auto InputField::handleKey(KeyEvent const& key) -> InputFieldAction
             _lastWasKill = false;
             return InputFieldAction::Changed;
         case KeyCode::Up:
-            historyPrev();
             _lastWasKill = false;
+            if (_multiline)
+                moveUp();  // moveUp() falls back to historyPrev() on first line
+            else
+                historyPrev();
             return InputFieldAction::Changed;
         case KeyCode::Down:
-            historyNext();
             _lastWasKill = false;
+            if (_multiline)
+                moveDown();  // moveDown() falls back to historyNext() on last line
+            else
+                historyNext();
             return InputFieldAction::Changed;
         case KeyCode::Left:
             if (ctrl)
@@ -180,12 +196,22 @@ auto InputField::handleKey(KeyEvent const& key) -> InputFieldAction
             _lastWasKill = false;
             return InputFieldAction::Changed;
         case KeyCode::Home:
-            moveToStart();
             _lastWasKill = false;
+            if (_multiline && ctrl)
+                moveToBufferStart();
+            else if (_multiline)
+                moveToLineStart();
+            else
+                moveToStart();
             return InputFieldAction::Changed;
         case KeyCode::End:
-            moveToEnd();
             _lastWasKill = false;
+            if (_multiline && ctrl)
+                moveToBufferEnd();
+            else if (_multiline)
+                moveToLineEnd();
+            else
+                moveToEnd();
             return InputFieldAction::Changed;
         default: break;
     }
@@ -196,12 +222,18 @@ auto InputField::handleKey(KeyEvent const& key) -> InputFieldAction
         switch (key.codepoint)
         {
             case 'a':
-                moveToStart();
                 _lastWasKill = false;
+                if (_multiline)
+                    moveToLineStart();
+                else
+                    moveToStart();
                 return InputFieldAction::Changed;
             case 'e':
-                moveToEnd();
                 _lastWasKill = false;
+                if (_multiline)
+                    moveToLineEnd();
+                else
+                    moveToEnd();
                 return InputFieldAction::Changed;
             case 'f':
                 moveForwardChar();
@@ -212,12 +244,18 @@ auto InputField::handleKey(KeyEvent const& key) -> InputFieldAction
                 _lastWasKill = false;
                 return InputFieldAction::Changed;
             case 'p':
-                historyPrev();
                 _lastWasKill = false;
+                if (_multiline)
+                    moveUp();
+                else
+                    historyPrev();
                 return InputFieldAction::Changed;
             case 'n':
-                historyNext();
                 _lastWasKill = false;
+                if (_multiline)
+                    moveDown();
+                else
+                    historyNext();
                 return InputFieldAction::Changed;
             case 'k': killToEnd(); return InputFieldAction::Changed;
             case 'u': killToStart(); return InputFieldAction::Changed;
@@ -266,7 +304,12 @@ auto InputField::handleKey(KeyEvent const& key) -> InputFieldAction
     // Printable codepoint
     if (key.codepoint != 0 && !ctrl && !alt && isPrintable(key.key))
     {
-        insertCodepoint(key.codepoint);
+        auto cp = key.codepoint;
+        // Handle Shift modifier for letter capitalization (needed for Kitty keyboard protocol)
+        // The terminal sends lowercase codepoint + Shift modifier, we need to uppercase it
+        if (shift && cp >= 'a' && cp <= 'z')
+            cp = cp - 'a' + 'A';
+        insertCodepoint(cp);
         _lastWasKill = false;
         return InputFieldAction::Changed;
     }
@@ -533,6 +576,226 @@ auto InputField::prevGraphemeCluster(std::size_t pos) const -> std::size_t
 auto InputField::isWordCharAt(char c) -> bool
 {
     return c != ' ' && c != '\t' && c != '\n' && c != '\r';
+}
+
+// ============================================================================
+// Multiline support
+// ============================================================================
+
+void InputField::setMultiline(bool enable)
+{
+    _multiline = enable;
+}
+
+auto InputField::isMultiline() const noexcept -> bool
+{
+    return _multiline;
+}
+
+auto InputField::lineCount() const noexcept -> int
+{
+    if (_buffer.empty())
+        return 1;
+
+    int count = 1;
+    for (char c : _buffer)
+    {
+        if (c == '\n')
+            ++count;
+    }
+    return count;
+}
+
+auto InputField::cursorLine() const noexcept -> int
+{
+    int line = 0;
+    for (std::size_t i = 0; i < _cursor && i < _buffer.size(); ++i)
+    {
+        if (_buffer[i] == '\n')
+            ++line;
+    }
+    return line;
+}
+
+auto InputField::cursorColumn() const noexcept -> int
+{
+    auto const lineStart = findLineStart(_cursor);
+    return countGraphemesInRange(lineStart, _cursor);
+}
+
+auto InputField::lineAt(int lineIndex) const -> std::string_view
+{
+    if (lineIndex < 0)
+        return {};
+
+    std::size_t start = 0;
+    int currentLine = 0;
+
+    // Find start of requested line
+    while (currentLine < lineIndex && start < _buffer.size())
+    {
+        if (_buffer[start] == '\n')
+            ++currentLine;
+        ++start;
+    }
+
+    if (currentLine < lineIndex)
+        return {};  // Line index out of range
+
+    // Find end of line
+    std::size_t end = start;
+    while (end < _buffer.size() && _buffer[end] != '\n')
+        ++end;
+
+    return std::string_view(_buffer).substr(start, end - start);
+}
+
+void InputField::setMaxLines(int maxLines)
+{
+    _maxLines = maxLines;
+}
+
+auto InputField::maxLines() const noexcept -> int
+{
+    return _maxLines;
+}
+
+auto InputField::findLineStart(std::size_t pos) const -> std::size_t
+{
+    if (pos == 0)
+        return 0;
+
+    // Search backward for newline
+    std::size_t i = pos;
+    while (i > 0)
+    {
+        --i;
+        if (_buffer[i] == '\n')
+            return i + 1;
+    }
+    return 0;
+}
+
+auto InputField::findLineEnd(std::size_t pos) const -> std::size_t
+{
+    std::size_t i = pos;
+    while (i < _buffer.size() && _buffer[i] != '\n')
+        ++i;
+    return i;
+}
+
+auto InputField::countGraphemesInRange(std::size_t start, std::size_t end) const -> int
+{
+    if (start >= end || start >= _buffer.size())
+        return 0;
+
+    auto const sv = std::string_view(_buffer).substr(start, end - start);
+    auto segmenter = unicode::utf8_grapheme_segmenter(sv);
+    int count = 0;
+    for ([[maybe_unused]] auto const& cluster : segmenter)
+        ++count;
+    return count;
+}
+
+auto InputField::moveToGraphemeInLine(std::size_t lineStart, int graphemeIndex) const -> std::size_t
+{
+    auto const lineEnd = findLineEnd(lineStart);
+    if (lineStart >= lineEnd)
+        return lineStart;
+
+    auto const sv = std::string_view(_buffer).substr(lineStart, lineEnd - lineStart);
+    auto segmenter = unicode::utf8_grapheme_segmenter(sv);
+
+    int currentIndex = 0;
+    for (auto it = segmenter.begin(); it != segmenter.end(); ++it)
+    {
+        if (currentIndex >= graphemeIndex)
+        {
+            auto const offset = static_cast<std::size_t>(it._clusterStart - sv.data());
+            return lineStart + offset;
+        }
+        ++currentIndex;
+    }
+
+    // Grapheme index exceeds line length, return end of line
+    return lineEnd;
+}
+
+void InputField::moveToBufferStart()
+{
+    _cursor = 0;
+}
+
+void InputField::moveToBufferEnd()
+{
+    _cursor = _buffer.size();
+}
+
+void InputField::moveToLineStart()
+{
+    _cursor = findLineStart(_cursor);
+}
+
+void InputField::moveToLineEnd()
+{
+    _cursor = findLineEnd(_cursor);
+}
+
+void InputField::moveUp()
+{
+    auto const currentLineNum = cursorLine();
+    if (currentLineNum == 0)
+    {
+        // Already on first line, delegate to history
+        historyPrev();
+        return;
+    }
+
+    // Remember current column (in graphemes)
+    auto const column = cursorColumn();
+
+    // Find start of current line, then go back to previous line
+    auto const currentLineStart = findLineStart(_cursor);
+    auto const prevLineEnd = currentLineStart > 0 ? currentLineStart - 1 : 0;
+    auto const prevLineStart = findLineStart(prevLineEnd);
+
+    // Move to same column in previous line (or end if line is shorter)
+    _cursor = moveToGraphemeInLine(prevLineStart, column);
+}
+
+void InputField::moveDown()
+{
+    auto const currentLineNum = cursorLine();
+    auto const totalLines = lineCount();
+    if (currentLineNum >= totalLines - 1)
+    {
+        // Already on last line, delegate to history
+        historyNext();
+        return;
+    }
+
+    // Remember current column (in graphemes)
+    auto const column = cursorColumn();
+
+    // Find end of current line, then go to next line
+    auto const currentLineEnd = findLineEnd(_cursor);
+    auto const nextLineStart = currentLineEnd < _buffer.size() ? currentLineEnd + 1 : _buffer.size();
+
+    // Move to same column in next line (or end if line is shorter)
+    _cursor = moveToGraphemeInLine(nextLineStart, column);
+}
+
+void InputField::insertNewline()
+{
+    if (!_multiline)
+        return;
+
+    // Check max lines limit
+    if (_maxLines > 0 && lineCount() >= _maxLines)
+        return;
+
+    _buffer.insert(_cursor, 1, '\n');
+    ++_cursor;
 }
 
 } // namespace mychat::tui

@@ -1,12 +1,19 @@
 add_library(mychat_tui
-    Terminal.cpp
-    TerminalInput.cpp
-    TerminalOutput.cpp
-    VtParser.cpp
+    Box.cpp
+    Dialog.cpp
     InputField.cpp
+    List.cpp
     LogPanel.cpp
     MarkdownRenderer.cpp
     Sixel.cpp
+    Spinner.cpp
+    StatusBar.cpp
+    Terminal.cpp
+    TerminalInput.cpp
+    TerminalOutput.cpp
+    Text.cpp
+    Theme.cpp
+    VtParser.cpp
 )
 add_library(mychat::tui ALIAS mychat_tui)
 

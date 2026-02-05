@@ -23,10 +23,14 @@
 #include <string>
 #include <vector>
 
+#include <tui/Box.hpp>
 #include <tui/InputField.hpp>
 #include <tui/LogPanel.hpp>
 #include <tui/MarkdownRenderer.hpp>
+#include <tui/Spinner.hpp>
+#include <tui/StatusBar.hpp>
 #include <tui/Terminal.hpp>
+#include <tui/Theme.hpp>
 
 namespace mychat
 {
@@ -39,7 +43,8 @@ namespace
     constexpr auto FloorDb = -48.0f;
 
     // Layout constants
-    constexpr auto InputBoxHeight = 3;
+    constexpr auto InputBoxMinHeight = 3;   ///< Minimum input box height (1 content line + 2 borders)
+    constexpr auto InputBoxMaxHeight = 10;  ///< Maximum input box height before scrolling
     constexpr auto InputBoxMaxWidth = 64;
 
     // Style helpers for terminal output
@@ -74,12 +79,13 @@ namespace
 /// @brief Layout geometry computed from terminal dimensions and current mode.
 struct LayoutGeometry
 {
-    int chatTop = 1;     ///< First row of the chat scroll region.
-    int chatBottom = 1;  ///< Last row of the chat scroll region.
-    int inputRow = 1;    ///< Top row of the 3-row input box.
-    int inputCol = 1;    ///< Left column of the input box.
-    int inputWidth = 64; ///< Width of the input box (including borders).
-    int logStartRow = 1; ///< First row of the log panel.
+    int chatTop = 1;      ///< First row of the chat scroll region.
+    int chatBottom = 1;   ///< Last row of the chat scroll region.
+    int inputRow = 1;     ///< Top row of the input box.
+    int inputCol = 1;     ///< Left column of the input box.
+    int inputWidth = 64;  ///< Width of the input box (including borders).
+    int inputHeight = 3;  ///< Height of the input box (dynamic based on content).
+    int logStartRow = 1;  ///< First row of the log panel.
 };
 
 struct App::Impl
@@ -110,15 +116,34 @@ struct App::Impl
 
     // Layout state
     tui::LogPanel logPanel;
+    tui::StatusBar statusBar;
+    tui::Spinner spinner { tui::SpinnerType::Dots };
     bool conversationStarted = false;
     bool tuiActive = false;
+    bool isProcessing = false;
     std::atomic<bool> logPanelDirty = false;
     LayoutGeometry geo;
+
+    // Input scroll state
+    int inputScrollOffset = 0;  ///< First visible character position (grapheme index)
+    int inputVerticalScrollOffset = 0;  ///< First visible line (for multiline scrolling)
+
+    /// @brief Computes the current input box height based on line count.
+    [[nodiscard]] auto computeInputBoxHeight() const -> int
+    {
+        auto const lines = inputField.lineCount();
+        auto const contentHeight = std::clamp(lines, 1, InputBoxMaxHeight - 2);
+        return std::max(InputBoxMinHeight, contentHeight + 2);  // +2 for top and bottom borders
+    }
 
     /// @brief Messages queued before TUI is active, replayed into the log panel on TUI start.
     std::vector<tui::LogEntry> pendingLogs;
 
-    explicit Impl(AppConfig cfg): config(std::move(cfg)), session(config.llm.systemPrompt) {}
+    explicit Impl(AppConfig cfg): config(std::move(cfg)), session(config.llm.systemPrompt)
+    {
+        inputField.setMultiline(true);
+        // No line limit - box grows to InputBoxMaxHeight then scrolls vertically
+    }
 
     /// @brief Replays all pending log messages into the log panel. Called once after TUI init.
     void replayPendingLogs()
@@ -136,21 +161,25 @@ struct App::Impl
         auto const cols = terminal.output().columns();
         auto const rows = terminal.output().rows();
         auto const logHeight = logPanel.totalHeight();
+        auto constexpr StatusBarHeight = 1;
 
         geo.inputWidth = std::min(InputBoxMaxWidth, cols - 4);
         geo.inputCol = (cols - geo.inputWidth) / 2 + 1;
+        geo.inputHeight = computeInputBoxHeight();
 
         if (conversationStarted)
         {
-            geo.logStartRow = rows - logHeight + 1;
-            geo.inputRow = geo.logStartRow - InputBoxHeight;
+            // Layout: [chat area] [input box] [log panel] [status bar]
+            geo.logStartRow = rows - StatusBarHeight - logHeight + 1;
+            geo.inputRow = geo.logStartRow - geo.inputHeight;
             geo.chatTop = 1;
             geo.chatBottom = geo.inputRow - 1;
         }
         else
         {
-            geo.logStartRow = rows - logHeight + 1;
-            geo.inputRow = rows / 2 - 1;
+            // Initial mode: centered input with log and status at bottom
+            geo.logStartRow = rows - StatusBarHeight - logHeight + 1;
+            geo.inputRow = rows / 2 - geo.inputHeight / 2;
             geo.inputCol = (cols - geo.inputWidth) / 2 + 1;
         }
     }
@@ -271,6 +300,7 @@ struct App::Impl
 
         renderLogPanel();
         renderInputBox();
+        renderStatusBar();
         positionCursorInInputBox();
         out.flush();
     }
@@ -299,6 +329,85 @@ struct App::Impl
         // by writeToChatArea / printUserMessage. Nothing to redraw here on initial render.
     }
 
+    /// @brief Calculates grapheme positions from the input text.
+    /// Returns a vector of byte offsets for each grapheme cluster start.
+    auto calculateGraphemePositions(std::string_view text) const -> std::vector<std::size_t>
+    {
+        auto positions = std::vector<std::size_t> {};
+        positions.push_back(0);
+
+        for (auto i = std::size_t { 0 }; i < text.size();)
+        {
+            auto const ch = static_cast<unsigned char>(text[i]);
+            auto charLen = std::size_t { 1 };
+
+            // Determine UTF-8 character length
+            if ((ch & 0x80) == 0)
+                charLen = 1;
+            else if ((ch & 0xE0) == 0xC0)
+                charLen = 2;
+            else if ((ch & 0xF0) == 0xE0)
+                charLen = 3;
+            else if ((ch & 0xF8) == 0xF0)
+                charLen = 4;
+
+            i += charLen;
+            if (i <= text.size())
+                positions.push_back(i);
+        }
+
+        return positions;
+    }
+
+    /// @brief Updates the scroll offset to ensure the cursor is visible.
+    void updateInputScrollOffset(int availableWidth)
+    {
+        auto const& text = inputField.text();
+        auto const cursorByte = inputField.cursor();
+        auto const graphemes = calculateGraphemePositions(text);
+
+        // Find cursor grapheme index
+        auto cursorGrapheme = 0;
+        for (auto i = std::size_t { 0 }; i < graphemes.size(); ++i)
+        {
+            if (graphemes[i] >= cursorByte)
+            {
+                cursorGrapheme = static_cast<int>(i);
+                break;
+            }
+            cursorGrapheme = static_cast<int>(i);
+        }
+
+        // Reserve space for scroll indicators
+        auto const hasLeftOverflow = inputScrollOffset > 0;
+        auto const totalGraphemes = static_cast<int>(graphemes.size()) - 1; // -1 for trailing position
+        auto const hasRightOverflow = (totalGraphemes - inputScrollOffset) > availableWidth;
+
+        auto effectiveWidth = availableWidth;
+        if (hasLeftOverflow)
+            effectiveWidth -= 1;  // Reserve space for left indicator
+        if (hasRightOverflow)
+            effectiveWidth -= 1;  // Reserve space for right indicator
+
+        effectiveWidth = std::max(1, effectiveWidth);
+
+        // Adjust scroll offset to keep cursor visible
+        if (cursorGrapheme < inputScrollOffset)
+        {
+            // Cursor is before visible area - scroll left
+            inputScrollOffset = cursorGrapheme;
+        }
+        else if (cursorGrapheme >= inputScrollOffset + effectiveWidth)
+        {
+            // Cursor is after visible area - scroll right
+            inputScrollOffset = cursorGrapheme - effectiveWidth + 1;
+        }
+
+        // Clamp scroll offset
+        inputScrollOffset = std::max(0, inputScrollOffset);
+        inputScrollOffset = std::min(inputScrollOffset, std::max(0, totalGraphemes - 1));
+    }
+
     /// @brief Renders the bordered input box at the computed position.
     void renderInputBox()
     {
@@ -307,102 +416,283 @@ struct App::Impl
         auto const row = geo.inputRow;
         auto const col = geo.inputCol;
 
-        // Top border: ╭───────────────╮
-        out.moveTo(row, col);
-        out.write("\u256D", borderStyle()); // ╭
-        auto topFill = std::string {};
-        for (auto i = 0; i < w - 2; ++i)
-            topFill += "\u2500"; // ─
+        auto const& theme = tui::currentTheme();
 
-        // Integrate voice meter into top border if active
+        // Build the box configuration
+        auto boxConfig = tui::BoxConfig {
+            .row = row,
+            .col = col,
+            .width = w,
+            .height = geo.inputHeight,
+            .border = theme.borderStyle,
+            .borderStyle = borderStyle(),
+            .title = std::nullopt,
+            .titleAlign = tui::TitleAlign::Left,
+            .titleStyle = {},
+            .paddingLeft = 1,
+            .paddingRight = 1,
+            .paddingTop = 0,
+            .paddingBottom = 0,
+            .fillBackground = false,
+            .backgroundStyle = {},
+        };
+
+        auto box = tui::Box(boxConfig);
+        box.render(out);
+
+        // Render content inside the box
+        auto const innerWidth = box.innerWidth();
+        auto const contentRow = box.contentStartRow();
+        auto const contentCol = box.contentStartCol();
+
+        // Voice meter in top-right if active
         if (voiceEnabled && audioPipeline)
         {
-            // Replace first few chars with voice meter
-            auto& output = terminal.output();
-            output.write(topFill.substr(0, 3), borderStyle()); // a few ─ chars
+            out.moveTo(row, col + w - static_cast<int>(MeterBarCount) - 3);
             renderVoiceMeter(audioPipeline->peakLevel());
-            // remaining border (estimate meter width ~ 6 chars)
-            auto const meterWidth = static_cast<int>(MeterBarCount) + 1; // bars + space
-            auto const remainingBorderChars = w - 2 - 3 - meterWidth;
-            if (remainingBorderChars > 0)
-            {
-                auto remainFill = std::string {};
-                for (auto i = 0; i < remainingBorderChars; ++i)
-                    remainFill += "\u2500";
-                output.write(remainFill, borderStyle());
-            }
         }
-        else
-        {
-            out.write(topFill, borderStyle());
-        }
-        out.write("\u256E", borderStyle()); // ╮
 
-        // Middle row: │ text... │
-        out.moveTo(row + 1, col);
-        out.write("\u2502", borderStyle()); // │
-        out.write(" ", {});                 // left padding
-
-        auto const innerWidth = w - 4; // 2 for borders, 2 for padding
+        // Calculate available width for text
         auto const& text = inputField.text();
-        if (text.empty())
-        {
-            // Placeholder
-            auto placeholder = std::string_view { "Ask anything\u2026" };
-            out.write(placeholder, grayStyle());
-            auto const placeholderLen = 14; // "Ask anything…" display width
-            auto const pad = std::max(0, innerWidth - placeholderLen);
-            out.writeRaw(std::string(static_cast<std::size_t>(pad), ' '));
-        }
-        else
-        {
-            // Actual text (truncated to fit)
-            auto displayText = std::string {};
-            auto displayLen = 0;
-            for (auto const ch: text)
-            {
-                if ((static_cast<unsigned char>(ch) & 0xC0) != 0x80)
-                    ++displayLen;
-                if (displayLen > innerWidth)
-                    break;
-                displayText += ch;
-            }
-            out.writeRaw(displayText);
-            auto const pad = std::max(0, innerWidth - displayLen);
-            out.writeRaw(std::string(static_cast<std::size_t>(pad), ' '));
-        }
-        out.write(" ", {});                 // right padding
-        out.write("\u2502", borderStyle()); // │
+        auto const prefixWidth = isProcessing ? 2 : 0;
+        auto availableWidth = innerWidth - prefixWidth;
 
-        // Bottom border: ╰───────────────╯
-        out.moveTo(row + 2, col);
-        out.write("\u2570", borderStyle()); // ╰
-        out.write(topFill, borderStyle());
-        out.write("\u256F", borderStyle()); // ╯
+        // Calculate content lines (visible rows in the box)
+        auto const contentLines = geo.inputHeight - 2;  // -2 for borders
+        auto const totalLines = inputField.lineCount();
+        auto const cursorLine = inputField.cursorLine();
+
+        // Update vertical scroll to keep cursor visible
+        if (cursorLine < inputVerticalScrollOffset)
+            inputVerticalScrollOffset = cursorLine;
+        else if (cursorLine >= inputVerticalScrollOffset + contentLines)
+            inputVerticalScrollOffset = cursorLine - contentLines + 1;
+
+        // Clamp vertical scroll
+        inputVerticalScrollOffset = std::max(0, inputVerticalScrollOffset);
+        inputVerticalScrollOffset = std::min(inputVerticalScrollOffset, std::max(0, totalLines - contentLines));
+
+        // Render each visible line
+        for (auto lineIdx = 0; lineIdx < contentLines; ++lineIdx)
+        {
+            auto const actualLine = inputVerticalScrollOffset + lineIdx;
+            out.moveTo(contentRow + lineIdx, contentCol);
+
+            // Show spinner only on the cursor line
+            auto linePrefixWidth = 0;
+            if (isProcessing && actualLine == cursorLine)
+            {
+                spinner.render(out, theme.textAccent);
+                out.writeRaw(" ");
+                linePrefixWidth = prefixWidth;
+            }
+            else if (isProcessing)
+            {
+                out.writeRaw("  ");  // Space for alignment
+                linePrefixWidth = prefixWidth;
+            }
+
+            auto lineAvailableWidth = availableWidth - linePrefixWidth;
+
+            if (actualLine >= totalLines)
+            {
+                // Empty line (beyond buffer content)
+                out.writeRaw(std::string(static_cast<std::size_t>(lineAvailableWidth), ' '));
+                continue;
+            }
+
+            auto lineText = inputField.lineAt(actualLine);
+
+            if (lineText.empty() && text.empty() && actualLine == 0 && !isProcessing)
+            {
+                // Placeholder on first line when empty
+                inputScrollOffset = 0;
+                auto placeholder = std::string_view { "Ask anything\u2026" };
+                out.write(placeholder, grayStyle());
+                auto const placeholderLen = 14;
+                auto const pad = std::max(0, lineAvailableWidth - placeholderLen);
+                out.writeRaw(std::string(static_cast<std::size_t>(pad), ' '));
+                continue;
+            }
+
+            if (lineText.empty())
+            {
+                out.writeRaw(std::string(static_cast<std::size_t>(lineAvailableWidth), ' '));
+                continue;
+            }
+
+            // Calculate grapheme positions for this line
+            auto const graphemes = calculateGraphemePositions(lineText);
+            auto const totalGraphemes = static_cast<int>(graphemes.size()) - 1;
+
+            // For the cursor line, handle horizontal scrolling
+            auto lineScrollOffset = 0;
+            if (actualLine == cursorLine)
+            {
+                // Use cursor column to determine scroll
+                auto const cursorCol = inputField.cursorColumn();
+                if (cursorCol < inputScrollOffset)
+                    inputScrollOffset = cursorCol;
+                else if (cursorCol >= inputScrollOffset + lineAvailableWidth)
+                    inputScrollOffset = cursorCol - lineAvailableWidth + 1;
+
+                inputScrollOffset = std::max(0, inputScrollOffset);
+                inputScrollOffset = std::min(inputScrollOffset, std::max(0, totalGraphemes - 1));
+                lineScrollOffset = inputScrollOffset;
+            }
+
+            // Determine overflow indicators
+            auto const hasLeftOverflow = lineScrollOffset > 0;
+            auto const visibleEnd = lineScrollOffset + lineAvailableWidth;
+            auto const hasRightOverflow = visibleEnd < totalGraphemes;
+
+            // Adjust available width for indicators
+            auto textWidth = lineAvailableWidth;
+            if (hasLeftOverflow)
+                textWidth -= 1;
+            if (hasRightOverflow)
+                textWidth -= 1;
+
+            textWidth = std::max(1, textWidth);
+
+            // Render left overflow indicator
+            if (hasLeftOverflow)
+            {
+                auto indicatorStyle = tui::Style {};
+                indicatorStyle.fg = tui::RgbColor { .r = 100, .g = 100, .b = 100 };
+                out.write("\u25C0", indicatorStyle);  // ◀
+            }
+
+            // Extract visible portion of line
+            auto const startByte = (lineScrollOffset < static_cast<int>(graphemes.size()))
+                                       ? graphemes[static_cast<std::size_t>(lineScrollOffset)]
+                                       : lineText.size();
+
+            auto visibleGraphemeEnd = std::min(lineScrollOffset + textWidth, totalGraphemes);
+            auto const endByte = (visibleGraphemeEnd < static_cast<int>(graphemes.size()))
+                                     ? graphemes[static_cast<std::size_t>(visibleGraphemeEnd)]
+                                     : lineText.size();
+
+            auto visibleText = lineText.substr(startByte, endByte - startByte);
+            out.writeRaw(visibleText);
+
+            // Calculate actual display width of visible text
+            auto displayedGraphemes = 0;
+            for (auto i = startByte; i < endByte;)
+            {
+                auto const ch = static_cast<unsigned char>(lineText[i]);
+                if ((ch & 0xC0) != 0x80)
+                    ++displayedGraphemes;
+                ++i;
+            }
+
+            // Padding
+            auto const pad = std::max(0, textWidth - displayedGraphemes);
+            out.writeRaw(std::string(static_cast<std::size_t>(pad), ' '));
+
+            // Render right overflow indicator
+            if (hasRightOverflow)
+            {
+                auto indicatorStyle = tui::Style {};
+                indicatorStyle.fg = tui::RgbColor { .r = 100, .g = 100, .b = 100 };
+                out.write("\u25B6", indicatorStyle);  // ▶
+            }
+            else if (hasLeftOverflow)
+            {
+                // Fill the space where right indicator would be
+                out.writeRaw(" ");
+            }
+        }
+
+        // Show vertical scroll indicators when content exceeds visible area
+        auto const hasContentAbove = inputVerticalScrollOffset > 0;
+        auto const hasContentBelow = (inputVerticalScrollOffset + contentLines) < totalLines;
+
+        if (hasContentAbove || hasContentBelow)
+        {
+            auto indicatorStyle = tui::Style {};
+            indicatorStyle.fg = tui::RgbColor { .r = 100, .g = 100, .b = 100 };
+
+            // ▲ indicator in top-right when content above
+            if (hasContentAbove)
+            {
+                out.moveTo(row, col + w - 2);
+                out.write("\u25B2", indicatorStyle);  // ▲
+            }
+
+            // ▼ indicator in bottom-right when content below
+            if (hasContentBelow)
+            {
+                out.moveTo(row + geo.inputHeight - 1, col + w - 2);
+                out.write("\u25BC", indicatorStyle);  // ▼
+            }
+        }
+
+        // Show line count in bottom border when multiline
+        if (totalLines > 1)
+        {
+            auto countStr = std::format(" {}/{} ", cursorLine + 1, totalLines);
+            auto const countLen = static_cast<int>(countStr.size());
+            auto const bottomRow = row + geo.inputHeight - 1;
+            auto const countCol = col + w - countLen - 3;  // -3 for potential ▼ indicator
+
+            if (countCol > col + 2)
+            {
+                out.moveTo(bottomRow, countCol);
+                auto countStyle = tui::Style {};
+                countStyle.dim = true;
+                out.write(countStr, countStyle);
+            }
+        }
+        // Show character count in bottom border when text is non-trivial (single line)
+        else if (!text.empty() && text.size() > 20)
+        {
+            auto const graphemes = calculateGraphemePositions(text);
+            auto const totalChars = static_cast<int>(graphemes.size()) - 1;
+
+            auto countStr = std::format(" {} ", totalChars);
+            auto const countLen = static_cast<int>(countStr.size());
+            auto const bottomRow = row + geo.inputHeight - 1;
+            auto const countCol = col + w - countLen - 2;
+
+            if (countCol > col + 2)
+            {
+                out.moveTo(bottomRow, countCol);
+                auto countStyle = tui::Style {};
+                countStyle.dim = true;
+                out.write(countStr, countStyle);
+            }
+        }
     }
 
     /// @brief Positions the terminal cursor inside the input box at the correct column.
     void positionCursorInInputBox()
     {
         auto& out = terminal.output();
-        auto const row = geo.inputRow + 1;     // middle row of input box
-        auto const textCol = geo.inputCol + 2; // after │ and space
 
-        // Calculate cursor column from InputField cursor position
-        auto cursorDisplayCol = 0;
-        auto const cursorPos = inputField.cursor();
-        auto const& text = inputField.text();
-        auto byteIdx = std::size_t { 0 };
-        for (auto const ch: text)
-        {
-            if (byteIdx >= static_cast<std::size_t>(cursorPos))
-                break;
-            if ((static_cast<unsigned char>(ch) & 0xC0) != 0x80)
-                ++cursorDisplayCol;
-            ++byteIdx;
-        }
+        // Calculate cursor's line and column
+        auto const cursorLine = inputField.cursorLine();
+        auto const cursorColumn = inputField.cursorColumn();
 
-        out.moveTo(row, textCol + cursorDisplayCol);
+        // Calculate which row in the box the cursor is on
+        auto const visibleLine = cursorLine - inputVerticalScrollOffset;
+        auto const row = geo.inputRow + 1 + visibleLine;  // +1 for top border
+
+        auto textCol = geo.inputCol + 2;  // after │ and space
+
+        // Account for prefix (spinner) width
+        auto const prefixWidth = isProcessing ? 2 : 0;
+        textCol += prefixWidth;
+
+        // Account for left overflow indicator (only on cursor line)
+        auto const hasLeftOverflow = inputScrollOffset > 0;
+        if (hasLeftOverflow)
+            textCol += 1;
+
+        // Calculate cursor position relative to scroll offset
+        auto const cursorCol = cursorColumn - inputScrollOffset;
+
+        out.moveTo(row, textCol + cursorCol);
         out.showCursor();
     }
 
@@ -413,6 +703,27 @@ struct App::Impl
         computeGeometry(); // recompute in case log panel height changed
         logPanel.render(out, geo.logStartRow, out.columns());
         out.flush();
+    }
+
+    /// @brief Renders the status bar at the bottom of the screen.
+    void renderStatusBar()
+    {
+        auto& out = terminal.output();
+        auto const cols = out.columns();
+        auto const rows = out.rows();
+
+        statusBar.clearHints();
+        statusBar.addHint("Ctrl+C", "Quit");
+        statusBar.addHint("Shift+Enter", "Newline");
+        statusBar.addHint("Ctrl+L", "Logs");
+        if (audioInitialized)
+            statusBar.addHint("/voice", voiceEnabled ? "Voice On" : "Voice Off");
+        if (ttsSpeaker)
+            statusBar.addHint("/tts", ttsEnabled ? "TTS On" : "TTS Off");
+        statusBar.addHint("/help", "Help");
+
+        statusBar.setStyle(tui::defaultStatusBarStyle());
+        statusBar.render(out, rows, cols);
     }
 
     // --- Voice meter ---
@@ -1068,6 +1379,8 @@ auto App::run() -> int
                     auto line = std::string(_impl->inputField.text());
                     _impl->inputField.addHistory(line);
                     _impl->inputField.clear();
+                    _impl->inputScrollOffset = 0;
+                    _impl->inputVerticalScrollOffset = 0;
 
                     // Handle empty Enter with voice enabled in push-to-talk mode
                     if (line.empty() && _impl->voiceEnabled
@@ -1295,6 +1608,9 @@ auto App::run() -> int
 
                     _impl->printUserMessage(line);
 
+                    // Mark as processing (for spinner display)
+                    _impl->isProcessing = true;
+
                     // Set scroll region for streaming output
                     output.setScrollRegion(_impl->geo.chatTop, _impl->geo.chatBottom);
                     output.moveTo(_impl->geo.chatBottom, 1);
@@ -1304,9 +1620,21 @@ auto App::run() -> int
                         mdRenderer.feedToken(token);
                         output.flush();
                         _impl->feedTtsToken(token);
+                        // Tick the spinner during streaming
+                        if (_impl->spinner.tick())
+                        {
+                            output.saveCursor();
+                            _impl->renderInputBox();
+                            output.restoreCursor();
+                            output.flush();
+                        }
                     };
 
                     auto result = _impl->agent->processMessage(line, streamCb);
+
+                    // Mark processing as complete
+                    _impl->isProcessing = false;
+
                     if (!result)
                         _impl->logError(std::format("{}", result.error()));
 
@@ -1322,6 +1650,7 @@ auto App::run() -> int
                         output.hideCursor();
                         _impl->renderInputBox();
                         _impl->renderLogPanel();
+                        _impl->renderStatusBar();
                         _impl->positionCursorInInputBox();
                         output.flush();
                     }
@@ -1330,6 +1659,8 @@ auto App::run() -> int
 
                 case tui::InputFieldAction::Abort:
                     _impl->inputField.clear();
+                    _impl->inputScrollOffset = 0;
+                    _impl->inputVerticalScrollOffset = 0;
                     running = false;
                     break;
 
@@ -1338,8 +1669,18 @@ auto App::run() -> int
                 case tui::InputFieldAction::Changed: {
                     auto sync = output.syncGuard();
                     output.hideCursor();
-                    _impl->renderInputBox();
-                    _impl->positionCursorInInputBox();
+                    // Check if input box height changed (line added/removed)
+                    auto const newHeight = _impl->computeInputBoxHeight();
+                    if (newHeight != _impl->geo.inputHeight)
+                    {
+                        // Height changed - need full redraw to reposition elements
+                        _impl->renderFullScreen();
+                    }
+                    else
+                    {
+                        _impl->renderInputBox();
+                        _impl->positionCursorInInputBox();
+                    }
                     output.flush();
                     break;
                 }

@@ -8,13 +8,20 @@
 #include <variant>
 #include <vector>
 
+#include <tui/Box.hpp>
+#include <tui/Dialog.hpp>
 #include <tui/InputEvent.hpp>
 #include <tui/InputField.hpp>
 #include <tui/KeyCode.hpp>
+#include <tui/List.hpp>
 #include <tui/MarkdownRenderer.hpp>
 #include <tui/Modifier.hpp>
 #include <tui/Sixel.hpp>
+#include <tui/Spinner.hpp>
+#include <tui/StatusBar.hpp>
 #include <tui/TerminalOutput.hpp>
+#include <tui/Text.hpp>
+#include <tui/Theme.hpp>
 #include <tui/VtParser.hpp>
 
 using namespace mychat::tui;
@@ -330,6 +337,36 @@ TEST_CASE("VtParser: CSIu (Kitty) Ctrl+a", "[tui][vtparser]")
     auto const& key = getKey(events[0]);
     CHECK(key.codepoint == 'a');
     CHECK(hasModifier(key.modifiers, Modifier::Ctrl));
+}
+
+TEST_CASE("VtParser: CSIu (Kitty) Shift+Enter", "[tui][vtparser]")
+{
+    auto parser = VtParser {};
+    auto events = parser.feed("\033[13;2u"); // 13=Enter, 2=Shift+1
+    REQUIRE(events.size() == 1);
+    auto const& key = getKey(events[0]);
+    CHECK(key.key == KeyCode::Enter);
+    CHECK(hasModifier(key.modifiers, Modifier::Shift));
+}
+
+TEST_CASE("VtParser: Alt+Enter (ESC CR)", "[tui][vtparser]")
+{
+    auto parser = VtParser {};
+    auto events = parser.feed("\033\r"); // ESC followed by CR
+    REQUIRE(events.size() == 1);
+    auto const& key = getKey(events[0]);
+    CHECK(key.key == KeyCode::Enter);
+    CHECK(hasModifier(key.modifiers, Modifier::Alt));
+}
+
+TEST_CASE("VtParser: Alt+Enter (ESC LF)", "[tui][vtparser]")
+{
+    auto parser = VtParser {};
+    auto events = parser.feed("\033\n"); // ESC followed by LF
+    REQUIRE(events.size() == 1);
+    auto const& key = getKey(events[0]);
+    CHECK(key.key == KeyCode::Enter);
+    CHECK(hasModifier(key.modifiers, Modifier::Alt));
 }
 
 TEST_CASE("VtParser: SS3 sequences", "[tui][vtparser]")
@@ -709,6 +746,33 @@ TEST_CASE("InputField: prompt get/set", "[tui][inputfield]")
     CHECK(field.prompt() == ">>> ");
 }
 
+TEST_CASE("InputField: Shift+letter capitalizes (Kitty protocol)", "[tui][inputfield]")
+{
+    auto field = InputField {};
+
+    // Simulate Kitty keyboard protocol: lowercase codepoint + Shift modifier
+    // Kitty sends the base key code (lowercase) with Shift modifier
+    auto shiftA = KeyEvent {
+        .key = keyCodeFromCodepoint('a'),
+        .modifiers = Modifier::Shift,
+        .codepoint = 'a',
+    };
+    (void) field.processEvent(shiftA);
+    CHECK(field.text() == "A");
+
+    auto shiftZ = KeyEvent {
+        .key = keyCodeFromCodepoint('z'),
+        .modifiers = Modifier::Shift,
+        .codepoint = 'z',
+    };
+    (void) field.processEvent(shiftZ);
+    CHECK(field.text() == "AZ");
+
+    // Regular lowercase should still work
+    (void) field.processEvent(charEvent('b'));
+    CHECK(field.text() == "AZb");
+}
+
 TEST_CASE("InputField: Alt+D kills word forward", "[tui][inputfield]")
 {
     auto field = InputField {};
@@ -726,6 +790,238 @@ TEST_CASE("InputField: insert in middle", "[tui][inputfield]")
     feed(field, charEvent('b'));
     CHECK(field.text() == "abc");
     CHECK(field.cursor() == 2);
+}
+
+// =============================================================================
+// InputField multiline tests
+// =============================================================================
+
+TEST_CASE("InputField: multiline mode disabled by default", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    CHECK_FALSE(field.isMultiline());
+    CHECK(field.lineCount() == 1);
+}
+
+TEST_CASE("InputField: enable multiline mode", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    CHECK(field.isMultiline());
+}
+
+TEST_CASE("InputField: Shift+Enter inserts newline in multiline mode", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    type(field, "line1");
+
+    // Shift+Enter should insert newline
+    auto shiftEnter = KeyEvent {
+        .key = KeyCode::Enter,
+        .modifiers = Modifier::Shift,
+        .codepoint = 0,
+    };
+    auto action = field.processEvent(shiftEnter);
+    CHECK(action == InputFieldAction::Changed);
+    CHECK(field.text() == "line1\n");
+    CHECK(field.lineCount() == 2);
+
+    type(field, "line2");
+    CHECK(field.text() == "line1\nline2");
+    CHECK(field.lineCount() == 2);
+}
+
+TEST_CASE("InputField: Shift+Enter submits in single-line mode", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    // Multiline disabled (default)
+    type(field, "text");
+
+    auto shiftEnter = KeyEvent {
+        .key = KeyCode::Enter,
+        .modifiers = Modifier::Shift,
+        .codepoint = 0,
+    };
+    // In single-line mode, Shift+Enter behaves like Enter (submit)
+    auto action = field.processEvent(shiftEnter);
+    CHECK(action == InputFieldAction::Submit);
+}
+
+TEST_CASE("InputField: Alt+Enter inserts newline in multiline mode", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    type(field, "line1");
+
+    // Alt+Enter should insert newline (works in all terminals)
+    auto altEnter = KeyEvent {
+        .key = KeyCode::Enter,
+        .modifiers = Modifier::Alt,
+        .codepoint = 0,
+    };
+    auto action = field.processEvent(altEnter);
+    CHECK(action == InputFieldAction::Changed);
+    CHECK(field.text() == "line1\n");
+    CHECK(field.lineCount() == 2);
+}
+
+TEST_CASE("InputField: lineAt returns correct content", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("first\nsecond\nthird");
+
+    CHECK(field.lineCount() == 3);
+    CHECK(field.lineAt(0) == "first");
+    CHECK(field.lineAt(1) == "second");
+    CHECK(field.lineAt(2) == "third");
+    CHECK(field.lineAt(3) == "");  // Out of range
+    CHECK(field.lineAt(-1) == ""); // Negative
+}
+
+TEST_CASE("InputField: cursorLine and cursorColumn", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("abc\nde\nfghij");
+
+    // Cursor at end: line 2, column 5
+    CHECK(field.cursorLine() == 2);
+    CHECK(field.cursorColumn() == 5);
+
+    // Move to start
+    feed(field, ctrlEvent('a'));  // In multiline, goes to line start
+    CHECK(field.cursorLine() == 2);
+    CHECK(field.cursorColumn() == 0);
+}
+
+TEST_CASE("InputField: moveUp in multiline mode", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("line1\nline2");
+    // Cursor at end of line2
+
+    feed(field, keyEvent(KeyCode::Up));
+    CHECK(field.cursorLine() == 0);
+    // Column should try to maintain position (5 in line1)
+    CHECK(field.cursorColumn() == 5);
+}
+
+TEST_CASE("InputField: moveDown in multiline mode", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("line1\nline2");
+
+    // Move to start
+    feed(field, keyEvent(KeyCode::Home));
+    feed(field, keyEvent(KeyCode::Home));  // Ensure at buffer start in case Ctrl wasn't held
+
+    // Actually use Ctrl+Home for buffer start if needed
+    field.setText("line1\nline2");
+    // Position cursor at start of line1
+    for (int i = 0; i < 11; ++i)
+        feed(field, keyEvent(KeyCode::Left));
+
+    CHECK(field.cursorLine() == 0);
+
+    feed(field, keyEvent(KeyCode::Down));
+    CHECK(field.cursorLine() == 1);
+}
+
+TEST_CASE("InputField: Up on first line triggers history in multiline mode", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.addHistory("previous");
+    field.setText("current");
+
+    // Move to first line, first column
+    feed(field, keyEvent(KeyCode::Home));
+    CHECK(field.cursorLine() == 0);
+
+    // Up should trigger history since we're on first line
+    feed(field, keyEvent(KeyCode::Up));
+    CHECK(field.text() == "previous");
+}
+
+TEST_CASE("InputField: maxLines limits newline insertion", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setMaxLines(2);
+    CHECK(field.maxLines() == 2);
+
+    type(field, "line1");
+    auto shiftEnter = KeyEvent {
+        .key = KeyCode::Enter,
+        .modifiers = Modifier::Shift,
+        .codepoint = 0,
+    };
+    (void) field.processEvent(shiftEnter);
+    type(field, "line2");
+    CHECK(field.lineCount() == 2);
+
+    // Try to add another line - should be blocked
+    (void) field.processEvent(shiftEnter);
+    CHECK(field.lineCount() == 2);  // Still 2, not 3
+}
+
+TEST_CASE("InputField: Home goes to line start in multiline", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("line1\nline2");
+    // Cursor at end of line2
+
+    feed(field, keyEvent(KeyCode::Home));
+    CHECK(field.cursorLine() == 1);  // Still on line2
+    CHECK(field.cursorColumn() == 0);  // At start of line
+}
+
+TEST_CASE("InputField: Ctrl+Home goes to buffer start in multiline", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("line1\nline2");
+    // Cursor at end of line2
+
+    feed(field, keyEvent(KeyCode::Home, Modifier::Ctrl));
+    CHECK(field.cursorLine() == 0);
+    CHECK(field.cursorColumn() == 0);
+    CHECK(field.cursor() == 0);
+}
+
+TEST_CASE("InputField: End goes to line end in multiline", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("line1\nline2");
+
+    // Move to start of buffer
+    feed(field, keyEvent(KeyCode::Home, Modifier::Ctrl));
+    CHECK(field.cursorColumn() == 0);
+
+    feed(field, keyEvent(KeyCode::End));
+    CHECK(field.cursorLine() == 0);  // Still on line1
+    CHECK(field.cursorColumn() == 5);  // At end of "line1"
+}
+
+TEST_CASE("InputField: Ctrl+End goes to buffer end in multiline", "[tui][inputfield][multiline]")
+{
+    auto field = InputField {};
+    field.setMultiline(true);
+    field.setText("line1\nline2");
+
+    // Move to start
+    feed(field, keyEvent(KeyCode::Home, Modifier::Ctrl));
+
+    feed(field, keyEvent(KeyCode::End, Modifier::Ctrl));
+    CHECK(field.cursorLine() == 1);
+    CHECK(field.cursorColumn() == 5);
+    CHECK(field.cursor() == field.text().size());
 }
 
 // =============================================================================
@@ -1116,4 +1412,604 @@ TEST_CASE("LogPanel: concurrent addLog from multiple threads", "[tui][logpanel][
         th.join();
 
     CHECK(panel.entryCount() == static_cast<std::size_t>(ThreadCount * MessagesPerThread));
+}
+
+// =============================================================================
+// Box tests
+// =============================================================================
+
+TEST_CASE("Box: basic configuration", "[tui][box]")
+{
+    auto config = BoxConfig {
+        .row = 5,
+        .col = 10,
+        .width = 40,
+        .height = 10,
+        .border = BorderStyle::Rounded,
+        .borderStyle = {},
+        .title = "Test Box",
+        .titleAlign = TitleAlign::Center,
+        .titleStyle = {},
+        .paddingLeft = 1,
+        .paddingRight = 1,
+        .paddingTop = 0,
+        .paddingBottom = 0,
+        .fillBackground = false,
+        .backgroundStyle = {},
+    };
+
+    auto box = Box(config);
+
+    CHECK(box.config().row == 5);
+    CHECK(box.config().col == 10);
+    CHECK(box.config().width == 40);
+    CHECK(box.config().height == 10);
+}
+
+TEST_CASE("Box: inner dimensions", "[tui][box]")
+{
+    auto config = BoxConfig {
+        .row = 1,
+        .col = 1,
+        .width = 20,
+        .height = 10,
+        .border = BorderStyle::Single,
+        .borderStyle = {},
+        .title = std::nullopt,
+        .titleAlign = TitleAlign::Left,
+        .titleStyle = {},
+        .paddingLeft = 2,
+        .paddingRight = 2,
+        .paddingTop = 1,
+        .paddingBottom = 1,
+        .fillBackground = false,
+        .backgroundStyle = {},
+    };
+
+    auto box = Box(config);
+
+    // Width: 20 - 2 (borders) - 2 (paddingLeft) - 2 (paddingRight) = 14
+    CHECK(box.innerWidth() == 14);
+
+    // Height: 10 - 2 (borders) - 1 (paddingTop) - 1 (paddingBottom) = 6
+    CHECK(box.innerHeight() == 6);
+
+    // Content starts at row 1 + 1 (border) + 1 (paddingTop) = 3
+    CHECK(box.contentStartRow() == 3);
+
+    // Content starts at col 1 + 1 (border) + 2 (paddingLeft) = 4
+    CHECK(box.contentStartCol() == 4);
+}
+
+TEST_CASE("Box: border styles", "[tui][box]")
+{
+    SECTION("Single border")
+    {
+        auto chars = BorderChars::fromStyle(BorderStyle::Single);
+        CHECK(chars.topLeft == "\u250C");
+        CHECK(chars.horizontal == "\u2500");
+    }
+
+    SECTION("Rounded border")
+    {
+        auto chars = BorderChars::fromStyle(BorderStyle::Rounded);
+        CHECK(chars.topLeft == "\u256D");
+    }
+
+    SECTION("Double border")
+    {
+        auto chars = BorderChars::fromStyle(BorderStyle::Double);
+        CHECK(chars.topLeft == "\u2554");
+        CHECK(chars.horizontal == "\u2550");
+    }
+
+    SECTION("Heavy border")
+    {
+        auto chars = BorderChars::fromStyle(BorderStyle::Heavy);
+        CHECK(chars.topLeft == "\u250F");
+    }
+}
+
+TEST_CASE("Box: render does not crash", "[tui][box]")
+{
+    auto output = TerminalOutput {};
+    static_cast<void>(output.initialize());
+
+    auto config = BoxConfig {
+        .row = 1,
+        .col = 1,
+        .width = 30,
+        .height = 8,
+        .border = BorderStyle::Rounded,
+        .borderStyle = {},
+        .title = "Test",
+        .titleAlign = TitleAlign::Center,
+        .titleStyle = {},
+        .paddingLeft = 1,
+        .paddingRight = 1,
+        .paddingTop = 0,
+        .paddingBottom = 0,
+        .fillBackground = true,
+        .backgroundStyle = {},
+    };
+
+    auto box = Box(config);
+    box.render(output);
+    box.clearContent(output);
+}
+
+// =============================================================================
+// List tests
+// =============================================================================
+
+TEST_CASE("List: initial state", "[tui][list]")
+{
+    auto list = List {};
+    CHECK(list.empty());
+    CHECK(list.size() == 0);
+    CHECK(list.selectedIndex() == 0);
+    CHECK(!list.selectedItem().has_value());
+}
+
+TEST_CASE("List: set items", "[tui][list]")
+{
+    auto items = std::vector<ListItem> {
+        { .label = "Item 1", .description = "", .filterText = "", .enabled = true },
+        { .label = "Item 2", .description = "", .filterText = "", .enabled = true },
+        { .label = "Item 3", .description = "", .filterText = "", .enabled = true },
+    };
+
+    auto list = List(items);
+
+    CHECK(list.size() == 3);
+    CHECK(!list.empty());
+    CHECK(list.selectedIndex() == 0);
+    CHECK(list.selectedItem().has_value());
+    CHECK(list.selectedItem().value()->label == "Item 1");
+}
+
+TEST_CASE("List: navigation", "[tui][list]")
+{
+    auto items = std::vector<ListItem> {
+        { .label = "Item 1", .description = "", .filterText = "", .enabled = true },
+        { .label = "Item 2", .description = "", .filterText = "", .enabled = true },
+        { .label = "Item 3", .description = "", .filterText = "", .enabled = true },
+    };
+
+    auto list = List(items);
+
+    list.selectNext();
+    CHECK(list.selectedIndex() == 1);
+
+    list.selectNext();
+    CHECK(list.selectedIndex() == 2);
+
+    list.selectNext(); // Should not wrap
+    CHECK(list.selectedIndex() == 2);
+
+    list.selectPrevious();
+    CHECK(list.selectedIndex() == 1);
+
+    list.selectFirst();
+    CHECK(list.selectedIndex() == 0);
+
+    list.selectLast();
+    CHECK(list.selectedIndex() == 2);
+}
+
+TEST_CASE("List: filtering", "[tui][list]")
+{
+    auto items = std::vector<ListItem> {
+        { .label = "Apple", .description = "", .filterText = "", .enabled = true },
+        { .label = "Banana", .description = "", .filterText = "", .enabled = true },
+        { .label = "Cherry", .description = "", .filterText = "", .enabled = true },
+    };
+
+    auto list = List(items);
+
+    CHECK(list.visibleItems().size() == 3);
+
+    list.setFilter("an");
+    CHECK(list.visibleItems().size() == 1); // Only "Banana" matches
+
+    list.setFilter("a");
+    CHECK(list.visibleItems().size() == 2); // "Apple" and "Banana" match
+
+    list.clearFilter();
+    CHECK(list.visibleItems().size() == 3);
+}
+
+TEST_CASE("List: keyboard events", "[tui][list]")
+{
+    auto items = std::vector<ListItem> {
+        { .label = "Item 1", .description = "", .filterText = "", .enabled = true },
+        { .label = "Item 2", .description = "", .filterText = "", .enabled = true },
+    };
+
+    auto list = List(items);
+
+    auto action = list.processEvent(keyEvent(KeyCode::Down));
+    CHECK(action == ListAction::Changed);
+    CHECK(list.selectedIndex() == 1);
+
+    action = list.processEvent(keyEvent(KeyCode::Up));
+    CHECK(action == ListAction::Changed);
+    CHECK(list.selectedIndex() == 0);
+
+    action = list.processEvent(keyEvent(KeyCode::Enter));
+    CHECK(action == ListAction::Selected);
+
+    action = list.processEvent(keyEvent(KeyCode::Escape));
+    CHECK(action == ListAction::Cancelled);
+}
+
+TEST_CASE("List: disabled items", "[tui][list]")
+{
+    auto items = std::vector<ListItem> {
+        { .label = "Item 1", .description = "", .filterText = "", .enabled = true },
+        { .label = "Item 2", .description = "", .filterText = "", .enabled = false },
+        { .label = "Item 3", .description = "", .filterText = "", .enabled = true },
+    };
+
+    auto list = List(items);
+
+    list.selectNext(); // Should skip disabled Item 2
+    CHECK(list.selectedIndex() == 2);
+}
+
+// =============================================================================
+// Text tests
+// =============================================================================
+
+TEST_CASE("Text: basic text", "[tui][text]")
+{
+    auto text = Text("Hello, world!");
+    CHECK(text.text() == "Hello, world!");
+    CHECK(text.lines().size() == 1);
+}
+
+TEST_CASE("Text: multiline text", "[tui][text]")
+{
+    auto text = Text("Line 1\nLine 2\nLine 3");
+    CHECK(text.lines().size() == 3);
+}
+
+TEST_CASE("Text: word wrap", "[tui][text]")
+{
+    auto wrapped = wordWrap("Hello world this is a test", 10);
+    CHECK(wrapped.size() >= 2);
+    for (auto const& line: wrapped)
+        CHECK(displayWidth(line) <= 10);
+}
+
+TEST_CASE("Text: truncate", "[tui][text]")
+{
+    auto result = mychat::tui::truncate("Hello, world!", 8);
+    CHECK(mychat::tui::displayWidth(result) <= 8);
+    CHECK(result.find("\u2026") != std::string::npos); // Contains ellipsis
+}
+
+TEST_CASE("Text: display width", "[tui][text]")
+{
+    CHECK(displayWidth("hello") == 5);
+    CHECK(displayWidth("") == 0);
+    CHECK(displayWidth("test") == 4);
+}
+
+TEST_CASE("Text: alignment", "[tui][text]")
+{
+    auto text = Text("Test");
+    CHECK(text.align() == TextAlign::Left);
+
+    text.setAlign(TextAlign::Center);
+    CHECK(text.align() == TextAlign::Center);
+
+    text.setAlign(TextAlign::Right);
+    CHECK(text.align() == TextAlign::Right);
+}
+
+// =============================================================================
+// Spinner tests
+// =============================================================================
+
+TEST_CASE("Spinner: basic functionality", "[tui][spinner]")
+{
+    auto spinner = Spinner(SpinnerType::Dots);
+
+    CHECK(spinner.frameCount() > 0);
+    CHECK(spinner.frameIndex() == 0);
+    CHECK(!spinner.currentFrame().empty());
+}
+
+TEST_CASE("Spinner: different types", "[tui][spinner]")
+{
+    SECTION("Dots spinner")
+    {
+        auto frames = spinnerFrames(SpinnerType::Dots);
+        CHECK(frames.size() == 10);
+    }
+
+    SECTION("Line spinner")
+    {
+        auto frames = spinnerFrames(SpinnerType::Line);
+        CHECK(frames.size() == 4);
+    }
+
+    SECTION("Circle spinner")
+    {
+        auto frames = spinnerFrames(SpinnerType::Circle);
+        CHECK(frames.size() == 4);
+    }
+}
+
+TEST_CASE("Spinner: reset", "[tui][spinner]")
+{
+    auto spinner = Spinner(SpinnerType::Line);
+    // Force advance by manipulating internal state through API
+    spinner.reset();
+    CHECK(spinner.frameIndex() == 0);
+}
+
+TEST_CASE("ProgressBar: basic functionality", "[tui][spinner]")
+{
+    auto bar = ProgressBar(20);
+
+    CHECK(bar.progress() == 0.0f);
+    CHECK(bar.width() == 20);
+
+    bar.setProgress(0.5f);
+    CHECK(bar.progress() == 0.5f);
+
+    bar.setProgress(1.5f); // Should clamp to 1.0
+    CHECK(bar.progress() == 1.0f);
+
+    bar.setProgress(-0.5f); // Should clamp to 0.0
+    CHECK(bar.progress() == 0.0f);
+}
+
+// =============================================================================
+// StatusBar tests
+// =============================================================================
+
+TEST_CASE("StatusBar: hints management", "[tui][statusbar]")
+{
+    auto bar = StatusBar {};
+
+    bar.addHint("Ctrl+C", "Quit");
+    bar.addHint("Enter", "Submit");
+
+    auto hints = std::vector<KeyHint> {
+        { .key = "Ctrl+N", .action = "New" },
+        { .key = "Ctrl+O", .action = "Open" },
+    };
+    bar.setHints(hints);
+
+    bar.clearHints();
+}
+
+TEST_CASE("StatusBar: text sections", "[tui][statusbar]")
+{
+    auto bar = StatusBar {};
+
+    bar.setLeftText("Left");
+    bar.setCenterText("Center");
+    bar.setRightText("Right");
+}
+
+TEST_CASE("StatusBar: styling", "[tui][statusbar]")
+{
+    auto style = defaultStatusBarStyle();
+    CHECK(style.keyStyle.bold);
+}
+
+TEST_CASE("StatusBar: render does not crash", "[tui][statusbar]")
+{
+    auto output = TerminalOutput {};
+    static_cast<void>(output.initialize());
+
+    auto bar = StatusBar {};
+    bar.addHint("Ctrl+C", "Quit");
+    bar.setRightText("mychat v1.0");
+
+    bar.render(output, 24, 80);
+}
+
+// =============================================================================
+// Dialog tests
+// =============================================================================
+
+TEST_CASE("SelectDialog: basic functionality", "[tui][dialog]")
+{
+    auto config = SelectDialogConfig {
+        .title = "Select Item",
+        .items = {
+            { .label = "Option 1", .description = "", .filterText = "", .enabled = true },
+            { .label = "Option 2", .description = "", .filterText = "", .enabled = true },
+        },
+        .width = 40,
+        .maxHeight = 20,
+        .border = BorderStyle::Rounded,
+        .borderStyle = {},
+        .titleStyle = {},
+        .dimBackground = true,
+        .confirmHint = "Enter",
+        .cancelHint = "Esc",
+    };
+
+    auto dialog = SelectDialog(config);
+
+    CHECK(dialog.selectedIndex() == 0);
+
+    auto result = dialog.processEvent(keyEvent(KeyCode::Down));
+    CHECK(result == DialogResult::Changed);
+    CHECK(dialog.selectedIndex() == 1);
+
+    result = dialog.processEvent(keyEvent(KeyCode::Enter));
+    CHECK(result == DialogResult::Confirmed);
+}
+
+TEST_CASE("SelectDialog: cancel", "[tui][dialog]")
+{
+    auto config = SelectDialogConfig {
+        .title = "Test",
+        .items = {{ .label = "Item", .description = "", .filterText = "", .enabled = true }},
+        .width = 30,
+        .maxHeight = 10,
+        .border = BorderStyle::Single,
+        .borderStyle = {},
+        .titleStyle = {},
+        .dimBackground = false,
+        .confirmHint = "Enter",
+        .cancelHint = "Esc",
+    };
+
+    auto dialog = SelectDialog(config);
+
+    auto result = dialog.processEvent(keyEvent(KeyCode::Escape));
+    CHECK(result == DialogResult::Cancelled);
+}
+
+TEST_CASE("ConfirmDialog: yes/no navigation", "[tui][dialog]")
+{
+    auto config = ConfirmDialogConfig {
+        .title = "Confirm",
+        .message = "Are you sure?",
+        .confirmLabel = "Yes",
+        .cancelLabel = "No",
+        .defaultConfirm = false,
+        .width = 40,
+        .border = BorderStyle::Rounded,
+        .borderStyle = {},
+        .titleStyle = {},
+        .messageStyle = {},
+        .dimBackground = true,
+    };
+
+    auto dialog = ConfirmDialog(config);
+
+    CHECK(!dialog.isConfirmSelected()); // Default to "No"
+
+    auto result = dialog.processEvent(keyEvent(KeyCode::Left));
+    CHECK(result == DialogResult::Changed);
+    CHECK(dialog.isConfirmSelected()); // Now on "Yes"
+
+    result = dialog.processEvent(keyEvent(KeyCode::Enter));
+    CHECK(result == DialogResult::Confirmed);
+}
+
+TEST_CASE("ConfirmDialog: shortcuts", "[tui][dialog]")
+{
+    auto config = ConfirmDialogConfig {
+        .title = "Test",
+        .message = "Test?",
+        .confirmLabel = "Yes",
+        .cancelLabel = "No",
+        .defaultConfirm = false,
+        .width = 30,
+        .border = BorderStyle::Single,
+        .borderStyle = {},
+        .titleStyle = {},
+        .messageStyle = {},
+        .dimBackground = false,
+    };
+
+    auto dialog = ConfirmDialog(config);
+
+    // 'y' should confirm
+    auto yEvent = KeyEvent { .key = keyCodeFromCodepoint('y'), .modifiers = Modifier::None, .codepoint = 'y' };
+    auto result = dialog.processEvent(yEvent);
+    CHECK(result == DialogResult::Confirmed);
+
+    // 'n' should cancel
+    auto nEvent = KeyEvent { .key = keyCodeFromCodepoint('n'), .modifiers = Modifier::None, .codepoint = 'n' };
+    result = dialog.processEvent(nEvent);
+    CHECK(result == DialogResult::Cancelled);
+}
+
+TEST_CASE("InputDialog: text input", "[tui][dialog]")
+{
+    auto config = InputDialogConfig {
+        .title = "Input",
+        .prompt = "Enter name:",
+        .placeholder = "Name...",
+        .initialValue = "",
+        .width = 50,
+        .border = BorderStyle::Rounded,
+        .borderStyle = {},
+        .titleStyle = {},
+        .inputStyle = {},
+        .dimBackground = true,
+    };
+
+    auto dialog = InputDialog(config);
+    CHECK(dialog.value().empty());
+
+    // Type a character
+    auto aEvent = KeyEvent { .key = keyCodeFromCodepoint('a'), .modifiers = Modifier::None, .codepoint = 'a' };
+    auto result = dialog.processEvent(aEvent);
+    CHECK(result == DialogResult::Changed);
+    CHECK(dialog.value() == "a");
+
+    // Backspace
+    result = dialog.processEvent(keyEvent(KeyCode::Backspace));
+    CHECK(result == DialogResult::Changed);
+    CHECK(dialog.value().empty());
+
+    dialog.setValue("test");
+    CHECK(dialog.value() == "test");
+}
+
+// =============================================================================
+// Theme tests
+// =============================================================================
+
+TEST_CASE("Theme: dark theme", "[tui][theme]")
+{
+    auto theme = darkTheme();
+
+    CHECK(theme.colors.primary.r > 0);
+    CHECK(theme.colors.background.r < 100); // Dark background
+    CHECK(theme.textNormal.fg.index() != 0); // Has a color set
+    CHECK(theme.borderStyle == BorderStyle::Rounded);
+}
+
+TEST_CASE("Theme: light theme", "[tui][theme]")
+{
+    auto theme = lightTheme();
+
+    CHECK(theme.colors.background.r > 200); // Light background
+    CHECK(theme.borderStyle == BorderStyle::Rounded);
+}
+
+TEST_CASE("Theme: mono theme", "[tui][theme]")
+{
+    auto theme = monoTheme();
+
+    CHECK(theme.borderStyle == BorderStyle::Single);
+    CHECK(theme.textBold.bold);
+}
+
+TEST_CASE("ThemeManager: singleton", "[tui][theme]")
+{
+    auto& manager1 = ThemeManager::instance();
+    auto& manager2 = ThemeManager::instance();
+
+    CHECK(&manager1 == &manager2);
+}
+
+TEST_CASE("ThemeManager: set theme", "[tui][theme]")
+{
+    auto& manager = ThemeManager::instance();
+
+    manager.setCurrent(lightTheme());
+    CHECK(manager.current().colors.background.r > 200);
+
+    manager.reset();
+    CHECK(manager.current().colors.background.r < 100); // Back to dark theme
+}
+
+TEST_CASE("currentTheme: convenience function", "[tui][theme]")
+{
+    auto const& theme = currentTheme();
+    CHECK(theme.borderStyle == BorderStyle::Rounded);
 }

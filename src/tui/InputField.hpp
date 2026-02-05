@@ -21,11 +21,17 @@ enum class InputFieldAction : std::uint8_t
     None,    ///< Event not consumed by InputField.
 };
 
-/// @brief Pure-model line editor with Emacs keybindings, history, and kill ring.
+/// @brief Pure-model text editor with Emacs keybindings, history, and kill ring.
 ///
 /// Accepts InputEvent objects and updates internal state. No I/O — the caller
 /// renders based on text() and cursor(). Operates on grapheme cluster boundaries
 /// using libunicode for correct Unicode handling.
+///
+/// Supports both single-line and multiline modes. In multiline mode:
+/// - Shift+Enter inserts a newline
+/// - Up/Down navigate between lines (history when on first/last line)
+/// - Home/End move to start/end of current line
+/// - Ctrl+Home/Ctrl+End move to start/end of buffer
 class InputField
 {
   public:
@@ -62,10 +68,37 @@ class InputField
     /// @param n Maximum history size.
     void setMaxHistory(std::size_t n);
 
+    /// @brief Enables or disables multiline mode.
+    /// @param enable True to enable multiline editing.
+    void setMultiline(bool enable);
+
+    /// @brief Returns whether multiline mode is enabled.
+    [[nodiscard]] auto isMultiline() const noexcept -> bool;
+
+    /// @brief Returns the number of lines in the current buffer.
+    [[nodiscard]] auto lineCount() const noexcept -> int;
+
+    /// @brief Returns the current cursor line (0-based).
+    [[nodiscard]] auto cursorLine() const noexcept -> int;
+
+    /// @brief Returns the current cursor column within the line (0-based, in graphemes).
+    [[nodiscard]] auto cursorColumn() const noexcept -> int;
+
+    /// @brief Returns the content of a specific line (0-based index).
+    [[nodiscard]] auto lineAt(int lineIndex) const -> std::string_view;
+
+    /// @brief Sets the maximum number of lines allowed in multiline mode (0 = unlimited).
+    void setMaxLines(int maxLines);
+
+    /// @brief Returns the maximum number of lines allowed.
+    [[nodiscard]] auto maxLines() const noexcept -> int;
+
   private:
     std::string _buffer;
     std::size_t _cursor = 0;
     std::string _prompt;
+    bool _multiline = false;
+    int _maxLines = 0;  ///< 0 = unlimited
 
     // History
     std::vector<std::string> _history;
@@ -91,15 +124,22 @@ class InputField
     void yankPop();            ///< Alt+Y: Cycle kill ring.
     void deleteChar();         ///< Delete / Ctrl+D: Delete character at cursor.
     void deleteCharBackward(); ///< Backspace: Delete character before cursor.
-    void moveToStart();        ///< Ctrl+A / Home: Move cursor to start.
-    void moveToEnd();          ///< Ctrl+E / End: Move cursor to end.
+    void moveToStart();        ///< Ctrl+A / Home: Move cursor to start of line (or buffer).
+    void moveToEnd();          ///< Ctrl+E / End: Move cursor to end of line (or buffer).
+    void moveToBufferStart();  ///< Move cursor to start of buffer.
+    void moveToBufferEnd();    ///< Move cursor to end of buffer.
+    void moveToLineStart();    ///< Move cursor to start of current line.
+    void moveToLineEnd();      ///< Move cursor to end of current line.
     void moveForwardChar();    ///< Ctrl+F / Right: Move cursor forward one grapheme.
     void moveBackwardChar();   ///< Ctrl+B / Left: Move cursor backward one grapheme.
     void moveForwardWord();    ///< Alt+F / Ctrl+Right: Move cursor forward one word.
     void moveBackwardWord();   ///< Alt+B / Ctrl+Left: Move cursor backward one word.
+    void moveUp();             ///< Move cursor up one line (multiline mode).
+    void moveDown();           ///< Move cursor down one line (multiline mode).
     void historyPrev();        ///< Up / Ctrl+P: Previous history entry.
     void historyNext();        ///< Down / Ctrl+N: Next history entry.
     void transpose();          ///< Ctrl+T: Transpose characters before cursor.
+    void insertNewline();      ///< Insert a newline at cursor (multiline mode).
 
     /// @brief Pushes text onto the kill ring.
     void pushKillRing(std::string text);
@@ -109,6 +149,12 @@ class InputField
 
     /// @brief Inserts a UTF-8 string at the cursor.
     void insertText(std::string_view text);
+
+    // Line position helpers
+    [[nodiscard]] auto findLineStart(std::size_t pos) const -> std::size_t;
+    [[nodiscard]] auto findLineEnd(std::size_t pos) const -> std::size_t;
+    [[nodiscard]] auto countGraphemesInRange(std::size_t start, std::size_t end) const -> int;
+    [[nodiscard]] auto moveToGraphemeInLine(std::size_t lineStart, int graphemeIndex) const -> std::size_t;
 
     // Unicode helpers (using libunicode)
     [[nodiscard]] auto nextGraphemeCluster(std::size_t pos) const -> std::size_t;

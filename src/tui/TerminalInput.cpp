@@ -17,7 +17,17 @@ namespace mychat::tui
 namespace
 {
     // Terminal protocol escape sequences
-    constexpr auto EnableCsiU = "\033[>1u";             // Kitty keyboard protocol level 1
+    //
+    // Kitty keyboard protocol flags (CSI > flags u):
+    //   1 = Disambiguate escape codes
+    //   2 = Report event types (press, repeat, release)
+    //   4 = Report alternate keys
+    //   8 = Report all keys as escape codes
+    //  16 = Report associated text
+    //
+    // We use flags 1|8=9 to ensure modifiers are reported for all keys including Enter.
+    // Flag 8 is needed because some terminals only report Shift+Enter with this flag.
+    constexpr auto EnableCsiU = "\033[>9u";             // Kitty keyboard protocol (disambiguate + all keys)
     constexpr auto DisableCsiU = "\033[<u";             // Pop Kitty keyboard protocol
     constexpr auto EnableSgrMouse = "\033[?1006h";      // SGR mouse mode
     constexpr auto DisableSgrMouse = "\033[?1006l";     // Disable SGR mouse mode
